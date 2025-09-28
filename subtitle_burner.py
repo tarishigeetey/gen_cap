@@ -12,6 +12,8 @@ Features:
 - Validates SRT content before converting to ASS.
 - Correct handling of hex colors for ASS (yellow appears yellow).
 - No border/outline or shadow for clean visuals.
+- Karaoke-style (incremental) word-by-word subtitle reveal.
+- Preserves original audio in final video.
 """
 
 import argparse
@@ -78,38 +80,64 @@ def validate_srt(srt_path):
 
 def hex_to_ass_color(color_hex: str):
     """Convert #RRGGBB -> ASS integer &HAABBGGRR"""
-    if not color_hex.startswith("#") or len(color_hex) != 7:
+    if not isinstance(color_hex, str) or not color_hex.startswith("#") or len(color_hex) != 7:
         return 0x00FFFFFF  # default white
-    r = int(color_hex[1:3], 16)
-    g = int(color_hex[3:5], 16)
-    b = int(color_hex[5:7], 16)
-    return 0x00000000 | (b << 16) | (g << 8) | r  # &H00BBGGRR
+    try:
+        r = int(color_hex[1:3], 16)
+        g = int(color_hex[3:5], 16)
+        b = int(color_hex[5:7], 16)
+    except ValueError:
+        return 0x00FFFFFF
+    return (b << 16) | (g << 8) | r  # AA will be 00
 
 def srt_to_ass_with_style(srt_path: str, ass_path: str, font: str, font_hindi: str = None,
                           fontsize: int = 36, color_hex: str = "#FFFFFF", position: str = "bottom", margin_v: int = 40):
-    subs = pysubs2.load(srt_path, format_="srt", encoding="utf-8")
+    orig_subs = pysubs2.load(srt_path, format_="srt", encoding="utf-8")
+
     style = pysubs2.SSAStyle()
     style.fontname = font
     style.fontsize = fontsize
     style.bold = True
-
-    # Correct color handling
     style.primarycolor = hex_to_ass_color(color_hex)
-
-    # Remove borders and shadows
     style.outline = 0
     style.shadow = 0
     style.outlinecolor = 0x00000000
     style.shadowcolor = 0x00000000
 
-    # Position mapping
     align_map = {"bottom": 2, "top": 8, "center": 5}
     style.alignment = align_map.get(position, 2)
     style.marginv = margin_v
 
-    subs.styles["Default"] = style
-    subs.save(ass_path, encoding="utf-8")
-    print(f"Wrote ASS to {ass_path} (bold, font={font}, size={fontsize}, color={color_hex}, no border)")
+    new_subs = pysubs2.SSAFile()
+    try:
+        new_subs.info = orig_subs.info.copy()
+    except Exception:
+        pass
+    new_subs.styles["Default"] = style
+
+    for event in orig_subs:
+        text = event.text.strip()
+        if not text:
+            new_subs.append(pysubs2.SSAEvent(start=event.start, end=event.end, text=text))
+            continue
+
+        words = text.split()
+        total_ms = max(1, event.end - event.start)
+        per_word_ms = max(40, total_ms // len(words))
+
+        for i in range(len(words)):
+            new_start = event.start + per_word_ms * i
+            new_end = event.end if i == len(words) - 1 else min(event.end, event.start + per_word_ms * (i + 1))
+            new_text = " ".join(words[: i + 1])
+            new_event = pysubs2.SSAEvent(start=int(new_start), end=int(new_end), text=new_text)
+            try:
+                new_event.style = event.style if event.style else "Default"
+            except Exception:
+                new_event.style = "Default"
+            new_subs.append(new_event)
+
+    new_subs.save(ass_path, encoding="utf-8")
+    print(f"Wrote ASS to {ass_path} (incremental word reveal, font={font}, size={fontsize}, color={color_hex}, no border)")
 
 def burn_ass_into_video(input_video: str, ass_file: str, output_video: str, crf: int = 18):
     cmd = [
@@ -119,14 +147,15 @@ def burn_ass_into_video(input_video: str, ass_file: str, output_video: str, crf:
         "-c:v", "libx264",
         "-crf", str(crf),
         "-preset", "medium",
-        "-c:a", "aac",
-        "-b:a", "192k",
+        "-pix_fmt", "yuv420p",      # ✅ ensures compatibility/downloadability
+        "-movflags", "+faststart",  # ✅ ensures progressive download
+        "-c:a", "copy",
         "-map", "0:v:0",
         "-map", "0:a:0?",
         output_video
     ]
     run_cmd(cmd)
-    print(f"Created video with burned subtitles: {output_video}")
+    print(f"Created video with burned subtitles (audio preserved): {output_video}")
 
 def main():
     parser = argparse.ArgumentParser(description="Generate/burn subtitles using Whisper + ffmpeg + pysubs2")
